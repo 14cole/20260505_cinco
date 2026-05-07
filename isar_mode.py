@@ -138,96 +138,6 @@ def _resolve_pad(
     return n_az
 
 
-def _interp_complex_1d(
-    target: np.ndarray, native: np.ndarray, values: np.ndarray
-) -> np.ndarray:
-    """1-D cubic-spline interpolation of complex values, zero outside support.
-
-    Cubic spline drops the polar→Cartesian noise floor by ~30 dB vs linear
-    interpolation; that's the difference between "everything orange" and
-    SABER's clean dark background.
-    """
-    from scipy.interpolate import CubicSpline
-
-    cs_r = CubicSpline(native, values.real, bc_type="not-a-knot", extrapolate=False)
-    cs_i = CubicSpline(native, values.imag, bc_type="not-a-knot", extrapolate=False)
-    out_r = cs_r(target)
-    out_i = cs_i(target)
-    out_r = np.where(np.isnan(out_r), 0.0, out_r)
-    out_i = np.where(np.isnan(out_i), 0.0, out_i)
-    return out_r + 1j * out_i
-
-
-def _pfa_polar_to_cart(
-    rcs_polar: np.ndarray,
-    theta: np.ndarray,
-    k: np.ndarray,
-    n_kx: int,
-    n_ky: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Two-stage 1-D cubic-spline interpolation from polar (theta, k) to
-    Cartesian (kx, ky).
-
-    Args:
-        rcs_polar: complex (N_az, N_freq) — sample at angle theta[j] and wavenumber k[i].
-        theta: (N_az,) radians, ascending.
-        k: (N_freq,) wavenumbers (rad/m), ascending.
-        n_kx, n_ky: target Cartesian grid dimensions.
-
-    Returns:
-        cart: complex (n_ky, n_kx) on a uniform Cartesian (kx, ky) grid.
-        kx_grid: (n_kx,) ascending.
-        ky_grid: (n_ky,) ascending.
-    """
-    n_az, n_freq = rcs_polar.shape
-    if n_az < 2 or n_freq < 2:
-        raise ValueError("PFA needs at least 2 angles and 2 frequencies")
-
-    # Actual bounding box of the polar arcs in Cartesian k-space.
-    # Each (θ_j, f_i) sample sits at (2·k_i·sin θ_j, 2·k_i·cos θ_j); the
-    # corners of the box come from f_min and f_max times the extreme sines
-    # and cosines, which differs for symmetric, one-sided positive, and
-    # one-sided negative apertures.
-    th_max_abs = float(np.max(np.abs(theta)))
-    kmax = float(k.max())
-    kmin = float(k.min())
-    sin_t = np.sin(theta)
-    kx_candidates = np.concatenate((2.0 * kmin * sin_t, 2.0 * kmax * sin_t))
-    kx_min = float(kx_candidates.min())
-    kx_max = float(kx_candidates.max())
-    ky_min = 2.0 * kmin * np.cos(th_max_abs)
-    ky_max = 2.0 * kmax  # at theta=0, cos=1
-
-    kx_grid = np.linspace(kx_min, kx_max, n_kx)
-    ky_grid = np.linspace(ky_min, ky_max, n_ky)
-
-    # Stage 1: For each azimuth row, resample along ky onto the common ky_grid.
-    # Native ky for row j is 2·k·cos(theta[j]) (uniform, since k is uniform).
-    intermediate = np.zeros((n_az, n_ky), dtype=np.complex128)
-    for j in range(n_az):
-        ky_native = 2.0 * k * np.cos(theta[j])
-        if ky_native[0] > ky_native[-1]:
-            ky_native = ky_native[::-1]
-            row = rcs_polar[j, ::-1]
-        else:
-            row = rcs_polar[j, :]
-        intermediate[j, :] = _interp_complex_1d(ky_grid, ky_native, row)
-
-    # Stage 2: For each ky_grid[q], resample along kx onto the common kx_grid.
-    # Native kx at row j (after stage 1) is ky_grid[q] · tan(theta[j]).
-    cart = np.zeros((n_ky, n_kx), dtype=np.complex128)
-    tan_theta = np.tan(theta)
-    for q in range(n_ky):
-        kx_native = ky_grid[q] * tan_theta
-        if kx_native[0] > kx_native[-1]:
-            kx_native = kx_native[::-1]
-            col = intermediate[::-1, q]
-        else:
-            col = intermediate[:, q]
-        cart[q, :] = _interp_complex_1d(kx_grid, kx_native, col)
-
-    return cart, kx_grid, ky_grid
-
 
 def _compute_band_decoupled(
     self,
@@ -284,44 +194,87 @@ def _compute_band_pfa(
     n_kx: int,
     unit_scale: float,
 ):
-    """Polar-Format Algorithm: polar-domain window, polar→Cartesian remap, 2-D IFFT.
+    """Polar-Format Algorithm via NUFFT.
 
-    The window is applied in the polar (θ, f) domain *before* resampling, so
-    it tapers the actual fan-shaped data envelope. Windowing in the rectangular
-    (kx, ky) domain after resampling instead leaves the polar fan boundary
-    sharp, which produces strong rectilinear sidelobes that wash the image
-    floor up by 30-60 dB — the "everything is orange" symptom.
+    Computes the image directly from the non-uniformly-positioned polar samples
+    using a single 2-D type-1 NUFFT, bypassing the polar→Cartesian resampling
+    step entirely. This is what the math is *actually* asking for:
+
+        image(X, Y) = Σ_p S_p · exp(+j·(X·kx_p + Y·ky_p))
+
+    where (kx_p, ky_p) = 2·k_i·(sin θ_j, cos θ_j) for each polar sample.
+    The two-stage cubic-spline interp pipeline approximates this; NUFFT
+    computes it directly to ~1e-12 precision, eliminating the polar-fan
+    boundary artifacts and bringing per-scatterer sidelobes down to the
+    window's actual specification.
+
+    The window is applied in polar (θ, f) so it tapers the fan envelope.
     """
+    import finufft
+
     n_az = theta.size
     n_freq = freq_hz.size
 
-    c0 = 299_792_458.0
-    k = 2.0 * np.pi * freq_hz / c0  # (n_freq,) wavenumbers
-
-    n_ky = n_freq
+    n_ky_eff = n_freq
     n_kx_eff = max(n_kx, n_az)
 
-    # Apply window in the polar (θ, f) domain to taper the fan boundary.
+    # Window in polar (θ, f) — tapers the fan envelope.
     win_az = self._isar_window(n_az)
     win_freq = self._isar_window(n_freq)
     rcs_windowed = rcs_polar * np.outer(win_az, win_freq)
 
-    cart, kx_grid, ky_grid = _pfa_polar_to_cart(rcs_windowed, theta, k, n_kx_eff, n_ky)
+    # Spatial-frequency positions of each polar sample.
+    c0 = 299_792_458.0
+    k = 2.0 * np.pi * freq_hz / c0  # (n_freq,) wavenumbers
+    kx = 2.0 * np.outer(np.sin(theta), k)  # (n_az, n_freq)
+    ky = 2.0 * np.outer(np.cos(theta), k)  # (n_az, n_freq)
 
-    # 2-D IFFT. cart has shape (n_ky, n_kx_eff); IFFT preserves shape.
-    image = np.fft.ifft2(np.fft.ifftshift(cart))
-    image = np.fft.fftshift(image)
+    # Center the (kx, ky) sample positions and scale them to [-π, π], the
+    # input range finufft expects. Centering matters for ky which lives in
+    # [2·k_min·cos(θ_max), 2·k_max] (always positive, NOT symmetric about 0);
+    # using max(|ky|) instead would halve the y-axis extent and cut off
+    # scatterers past ±half-extent. The (kx_center, ky_center) shift adds a
+    # global phase that drops out under |·|.
+    kx_lo, kx_hi = float(kx.min()), float(kx.max())
+    ky_lo, ky_hi = float(ky.min()), float(ky.max())
+    kx_span = kx_hi - kx_lo
+    ky_span = ky_hi - ky_lo
+    if kx_span == 0.0 or ky_span == 0.0:
+        raise ValueError("PFA-NUFFT: degenerate (kx, ky) extent")
+    kx_center = 0.5 * (kx_lo + kx_hi)
+    ky_center = 0.5 * (ky_lo + ky_hi)
 
-    # Transpose to (n_kx_eff, n_ky) so callers see (cross-range, range), matching
-    # the shape convention used by _compute_band_decoupled.
-    image = image.T
+    kx_norm = ((kx - kx_center) * (2.0 * np.pi / kx_span)).ravel().astype(np.float64)
+    ky_norm = ((ky - ky_center) * (2.0 * np.pi / ky_span)).ravel().astype(np.float64)
 
-    dkx = kx_grid[1] - kx_grid[0]
-    dky = ky_grid[1] - ky_grid[0]
-    dx = 2.0 * np.pi / (n_kx_eff * dkx)
-    dy = 2.0 * np.pi / (n_ky * dky)
+    # Image-domain bin spacing from the FT pair: dx = 2π / kx_span.
+    dx = 2.0 * np.pi / kx_span
+    dy = 2.0 * np.pi / ky_span
+
+    # NUFFT type-1: non-uniform → uniform.
+    #   image[m1, m2] = Σ_p c[p] · exp(+j·(m1·kx_norm[p] + m2·ky_norm[p]))
+    # which (up to global phase) is the IFT of S evaluated at
+    #   X(m1) = m1·dx, Y(m2) = m2·dy.
+    image = finufft.nufft2d1(
+        kx_norm,
+        ky_norm,
+        rcs_windowed.ravel().astype(np.complex128),
+        n_modes=(n_kx_eff, n_ky_eff),
+        isign=+1,
+        eps=1.0e-12,
+    )
+
+    # Normalize by the coherent integration gain so a unit-amplitude scatterer
+    # produces a 0 dBsm peak regardless of window choice or sample count.
+    # NUFFT outputs raw sums (Σ c_p · phasor); without this scaling the
+    # peak would shift by ~55 dB vs the prior IFFT-based PFA, and your
+    # existing z-clamp range would be way off.
+    coherent_gain = float(np.sum(win_az)) * float(np.sum(win_freq))
+    if coherent_gain > 0.0:
+        image = image / coherent_gain
+
     x_range = (np.arange(n_kx_eff) - n_kx_eff // 2) * dx * unit_scale
-    y_range = (np.arange(n_ky) - n_ky // 2) * dy * unit_scale
+    y_range = (np.arange(n_ky_eff) - n_ky_eff // 2) * dy * unit_scale
 
     return image, x_range, y_range
 
@@ -415,15 +368,9 @@ def _compute_band(
             f"Likely a too-narrow azimuth selection or unit mismatch."
         )
 
-    magnitude = np.abs(complex_image)
-    if self._plot_scale_is_linear():
-        isar_display = magnitude
-    else:
-        isar_display = self.active_dataset.rcs_to_dbsm(magnitude)
-
     return {
         "az_values": az_values,
-        "isar_display": isar_display,
+        "magnitude": np.abs(complex_image),
         "x_range": x_range,
         "y_range": y_range,
         "az_nonuniformity": az_nonuniformity,
@@ -508,6 +455,21 @@ def render(self) -> None:
             self.status.showMessage(result)
             return
         band_results.append(result)
+
+    # Convert linear magnitudes to display values, optionally peak-normalised
+    # across all bands (so multi-band views share one reference peak).
+    peak_norm_widget = getattr(self, "chk_isar_peak_normalize", None)
+    peak_normalize = bool(peak_norm_widget.isChecked()) if peak_norm_widget else False
+    if peak_normalize:
+        global_peak = max(float(br["magnitude"].max()) for br in band_results)
+        if global_peak > 0.0:
+            for br in band_results:
+                br["magnitude"] = br["magnitude"] / global_peak
+    for br in band_results:
+        if self._plot_scale_is_linear():
+            br["isar_display"] = br["magnitude"]
+        else:
+            br["isar_display"] = self.active_dataset.rcs_to_dbsm(br["magnitude"])
 
     n_bands = len(band_results)
 
@@ -603,10 +565,11 @@ def render(self) -> None:
     self.spin_plot_ymax.blockSignals(False)
 
     # Auto-fit the z (dB) spinboxes only on the *first* render of a new
-    # dataset+algorithm combination. Re-running this on every render — which
-    # the per-keystroke `valueChanged` signal triggers — clobbers the user's
-    # typing whenever zmin transiently exceeds zmax mid-keystroke.
-    state_key = (id(self.active_dataset), algorithm)
+    # (dataset, algorithm, peak-norm) combination. Re-running this on every
+    # render — which the per-keystroke `valueChanged` signal triggers —
+    # clobbers the user's typing whenever zmin transiently exceeds zmax
+    # mid-keystroke.
+    state_key = (id(self.active_dataset), algorithm, peak_normalize)
     last_state = getattr(self, "_isar_last_autofit_state", None)
     if state_key != last_state:
         img_min = float("inf")
